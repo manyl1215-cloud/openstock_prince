@@ -2,28 +2,29 @@ name: Opening Premium Monitor
 
 on:
   schedule:
-    # 台灣時間 09:01 (UTC 01:01)，週一至週五執行
     - cron: '1 1 * * 1-5'
-  workflow_dispatch: # 允許手動點擊測試
+  workflow_dispatch:
 
 jobs:
   run_monitor:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4 # 👈 已更新至 v4，支援 Node 24
+        uses: actions/checkout@v4 # 升級到 v4
 
       - name: Setup Python
-        uses: actions/setup-python@v5 # 👈 已更新至 v5，支援 Node 24
+        uses: actions/setup-python@v5 # 升級到 v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
       - name: Install Libs
-        run: pip install yfinance pandas requests
+        run: |
+          pip install yfinance pandas requests gspread google-auth
 
       - name: Execute Script
         env:
-          # 這裡確保你的 Secrets 已經在 GitHub 設定好
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
         run: python stock_monitor.py
