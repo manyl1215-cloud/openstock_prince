@@ -2,7 +2,8 @@ name: Opening Premium Monitor
 
 on:
   schedule:
-    - cron: '1 1 * * 1-5'
+    # 台灣時間 09:16 (UTC 01:16)，週一至週五
+    - cron: '16 1 * * 1-5'
   workflow_dispatch:
 
 jobs:
