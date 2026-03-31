@@ -40,16 +40,22 @@ def send_telegram_msg(message):
         requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message})
 
 def write_to_sheet(rows):
+    if not rows: return
     try:
         creds_dict = json.loads(GCP_KEY)
         creds = Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/spreadsheets'])
         client = gspread.authorize(creds)
+        
+        # 這裡加上偵錯訊息
+        print(f"正在嘗試開啟試算表，ID 長度為: {len(SHEET_ID)}")
+        
         sheet = client.open_by_key(SHEET_ID).get_worksheet(0)
         sheet.append_rows(rows)
         return True
+    except gspread.exceptions.SpreadsheetNotFound:
+        send_telegram_msg("❌ 錯誤：找不到試算表！請檢查 GOOGLE_SHEET_ID 是否正確，並確認已共用權限。")
     except Exception as e:
-        send_telegram_msg(f"❌ Sheets 寫入失敗: {str(e)}")
-        return False
+        send_telegram_msg(f"❌ 發生其他錯誤: {str(e)}")
 
 # --- 早上 09:15 邏輯 ---
 def run_morning_report():
