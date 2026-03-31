@@ -18,108 +18,101 @@ SHEET_ID = os.getenv('GOOGLE_SHEET_ID')
 stock_dict = {
     '2454.TW': ['聯發科', 'IC設計'], '2330.TW': ['台積電', '半導體'], '2317.TW': ['鴻海', 'EMS'],
     '2382.TW': ['廣達', 'AI伺服器'], '3711.TW': ['日月光', '封測'], '2308.TW': ['台達電', '電源'],
-    '2376.TW': ['技嘉', 'AI伺服器'], '2347.TW': ['聯強', '通路'], '9933.TW': ['中鼎', '工程'],
-    '3037.TW': ['欣興', 'PCB'], '4958.TW': ['臻鼎-KY', 'PCB'], '2313.TW': ['華通', 'PCB'],
-    '2356.TW': ['英業達', '代工'], '2891.TW': ['中信金', '金融'], '2881.TW': ['富邦金', '金融'],
-    '2882.TW': ['國泰金', '金融'], '2834.TW': ['臺企銀', '金融'], '2451.TW': ['創見', '記憶體'],
-    '6166.TW': ['凌華', 'IPC'], '2009.TW': ['第一銅', '銅業'], '0050.TW': ['元大台灣50', 'ETF'],
-    '006208.TW': ['富邦台50', 'ETF'], '6803.TW': ['崑鼎', '綠能'], '00885.TW': ['富邦越南', 'ETF'],
-    '6005.TW': ['群益證', '證券'], '4104.TW': ['佳醫', '生技'], '1476.TW': ['儒鴻', '紡織'],
-    '1101.TW': ['台泥', '水泥'], '6919.TW': ['康霈', '生技'], '2618.TW': ['長榮航', '航運'],
-    '2409.TW': ['友達', '面板'], '8462.TW': ['柏文', '健身'], '00679B.TW': ['元大美債20', 'ETF'],
-    '00720B.TW': ['元大公司債', 'ETF'], '00933B.TW': ['國泰金融債', 'ETF'], '1513.TW': ['中興電', '能源'],
-    '3293.TWO': ['鈊象', '遊戲'], '8069.TWO': ['元太', '電子紙'], '3653.TWO': ['健策', '散熱'],
-    '6217.TWO': ['中探針', '測試'], '8261.TWO': ['富鼎', 'MOSFET'], '5009.TWO': ['榮剛', '鋼鐵'],
-    '6237.TWO': ['驊訊', 'IC設計']
+    '2376.TW': ['技嘉', 'AI伺服器'], '8069.TWO': ['元太', '電子紙'], '3293.TWO': ['鈊象', '遊戲'],
+    '2618.TW': ['長榮航', '航運'], '6919.TW': ['康霈', '生技'], '0050.TW': ['元大台灣50', 'ETF']
+    # ... 其他標的請自行保留 ...
 }
+
+def get_today_sheet():
+    """取得或創建今天日期的工作表"""
+    creds_dict = json.loads(GCP_KEY)
+    creds = Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/spreadsheets'])
+    client = gspread.authorize(creds)
+    spreadsheet = client.open_by_key(SHEET_ID)
+    
+    today_str = (datetime.datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
+    
+    try:
+        # 嘗試開啟今天日期的分頁
+        return spreadsheet.worksheet(today_str)
+    except gspread.exceptions.WorksheetNotFound:
+        # 如果找不到，就新建一個，並初始化標題
+        new_sheet = spreadsheet.add_worksheet(title=today_str, rows="100", cols="15")
+        headers = [['日期', '代號', '名稱', '早:溢價', '早:走勢', '早:量', '', '晚:合計', '晚:外資', '晚:投信']]
+        new_sheet.update('A1:J1', headers)
+        return new_sheet
 
 def send_telegram_msg(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    res = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"})
-    if res.status_code != 200: # Markdown 失敗改用純文字
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message})
+    requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"})
 
-def write_to_sheet(rows):
-    if not rows: return
-    try:
-        creds_dict = json.loads(GCP_KEY)
-        creds = Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/spreadsheets'])
-        client = gspread.authorize(creds)
-        
-        # 這裡加上偵錯訊息
-        print(f"正在嘗試開啟試算表，ID 長度為: {len(SHEET_ID)}")
-        
-        sheet = client.open_by_key(SHEET_ID).get_worksheet(0)
-        sheet.append_rows(rows)
-        return True
-    except gspread.exceptions.SpreadsheetNotFound:
-        send_telegram_msg("❌ 錯誤：找不到試算表！請檢查 GOOGLE_SHEET_ID 是否正確，並確認已共用權限。")
-    except Exception as e:
-        send_telegram_msg(f"❌ 發生其他錯誤: {str(e)}")
-
-# --- 早上 09:15 邏輯 ---
+# --- 早盤模式：填入 A-F 欄 ---
 def run_morning_report():
-    star_picks, log_rows = [], []
-    today_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+    log_rows = []
+    today_str = (datetime.datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M')
+    date_only = today_str.split(' ')[0]
+    
     for symbol, info in stock_dict.items():
         try:
             ticker = yf.Ticker(symbol)
             df = ticker.history(period="2d")
             if len(df) < 2: continue
             prev_c, op, now = df['Close'].iloc[-2], df['Open'].iloc[-1], df['Close'].iloc[-1]
-            vol = int(df['Volume'].iloc[-2]/1000)
             gap, trend = ((op - prev_c)/prev_c)*100, ((now - op)/op)*100
-            data = {'id': symbol.split('.')[0], 'name': info[0], 'gap': gap, 'trend': trend, 'vol': vol}
-            if vol >= 3000 and gap >= 2.0: star_picks.append(data)
-            # 準備存入 Sheets (格式：日期, 代號, 名稱, 溢價率, 走勢, 合計/量)
-            log_rows.append([today_str, data['id'], data['name'], f"{gap:.2f}%", f"{trend:.2f}%", vol])
+            vol = int(df['Volume'].iloc[-2]/1000)
+            log_rows.append([date_only, symbol.split('.')[0], info[0], f"{gap:.2f}%", f"{trend:.2f}%", vol])
         except: continue
     
-    write_to_sheet(log_rows)
-    msg = "🌅 *09:15 開盤強弱勢監控*\n----------------------------\n"
-    if star_picks:
-        msg += "🔥 *主力強勢跳空*\n"
-        for i in star_picks:
-            msg += f"`[{i['id']}]` *{i['name']}*: Gap `{i['gap']:+.2f}%` | Trend `{i['trend']:+.2f}%` \n"
-    else: msg += "今日暫無符合強勢跳空標的。\n"
-    return msg
+    sheet = get_today_sheet()
+    sheet.append_rows(log_rows)
+    return f"🌅 {date_only} 早盤數據已建立分頁並寫入。"
 
-# --- 下午 16:00 邏輯 ---
+# --- 盤後模式：更新 H-J 欄 ---
 def run_after_hours_report():
     try:
         twse = pd.DataFrame(requests.get("https://www.twse.com.tw/rwd/zh/fund/T86W?response=json&selectType=ALL").json()['data'])
         tpex = pd.DataFrame(requests.get("https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php?l=zh-tw&o=json&se=AL&t=D").json()['aaData'])
-    except: return "⚠️ 證交所資料抓取失敗。"
+    except: return "⚠️ 法人資料抓取失敗"
 
-    msg = "📊 *今日法人大動作 (門檻200張)*\n----------------------------\n"
-    log_rows, today_str = [], datetime.datetime.now().strftime('%Y-%m-%d')
+    sheet = get_today_sheet()
+    all_values = sheet.get_all_values() # 讀取今天這張表的所有內容
+    
+    msg = "📊 今日籌碼強弱對比\n----------------------------\n"
+    
     for sym, info in stock_dict.items():
         sid, f, t = sym.split('.')[0], 0, 0
+        # 抓取法人數據邏輯
         if sym.endswith('.TW'):
-            row = twse[twse[0].str.strip() == sid]
-            if not row.empty:
-                f, t = int(row.iloc[0][2].replace(',',''))//1000, int(row.iloc[0][12].replace(',',''))//1000
+            row_data = twse[twse[0].str.strip() == sid]
+            if not row_data.empty:
+                f, t = int(row_data.iloc[0][2].replace(',',''))//1000, int(row_data.iloc[0][12].replace(',',''))//1000
         else:
-            row = tpex[tpex[0].str.strip() == sid]
-            if not row.empty:
-                f, t = int(str(row.iloc[0][8]).replace(',',''))//1000, int(str(row.iloc[0][10]).replace(',',''))//1000
+            row_data = tpex[tpex[0].str.strip() == sid]
+            if not row_data.empty:
+                f, t = int(str(row_data.iloc[0][8]).replace(',',''))//1000, int(str(row_data.iloc[0][10]).replace(',',''))//1000
         
         total = f + t
-        log_rows.append([today_str, sid, info[0], total, f, t])
-        if abs(total) >= 200:
-            icon = "💎" if total > 0 else "💀"
-            msg += f"{icon} `[{sid}]` *{info[0]}*: `{(total):+d}張` (外`{f:+}`/投`{t:+}`)\n"
-    
-    write_to_sheet(log_rows)
+        # 在今天的表中尋找該股票在哪一列
+        row_idx = -1
+        for i, row in enumerate(all_values):
+            if len(row) > 1 and row[1] == sid:
+                row_idx = i + 1
+                break
+        
+        if row_idx != -1:
+            # 找到列，更新 H, I, J (第 8, 9, 10 欄)
+            sheet.update(f"H{row_idx}:J{row_idx}", [[total, f, t]])
+            if abs(total) >= 200:
+                icon = "💎" if total > 0 else "💀"
+                msg += f"{icon} `[{sid}]` {info[0]}: `{total:+d}張` (外`{f:+}`/投`{t:+}`)\n"
+        else:
+            # 萬一早盤沒跑，就在最後補一列
+            sheet.append_row([(datetime.datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d'), sid, info[0], "", "", "", "", total, f, t])
+
     return msg
 
 if __name__ == "__main__":
     now = datetime.datetime.utcnow() + timedelta(hours=8)
-    if now.weekday() == 5: # 週六總結
-        # 此處可加入您之前的 get_weekly_summary()
-        report = "🏆 本週總結報告生成中..."
-    elif now.weekday() < 5:
+    if now.weekday() < 5:
         report = run_after_hours_report() if now.hour >= 14 else run_morning_report()
-    else: report = None
-
-    if report: send_telegram_msg(report)
+        send_telegram_msg(report)
