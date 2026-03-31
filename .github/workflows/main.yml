@@ -1,10 +1,18 @@
-name: Stock opening Premium Monitor
+name: Taiwan Stock Automated Monitor
 
 on:
   schedule:
-    # 台灣時間 09:15 (等於 UTC 01:15)，週一至週五執行
+    # 1. 平日開盤監控：台灣時間 09:15 (UTC 01:15)，週一至週五
     - cron: '15 1 * * 1-5'
-  workflow_dispatch: # 允許您在 GitHub 頁面上手動點擊執行測試
+    
+    # 2. 平日盤後籌碼：台灣時間 16:00 (UTC 08:00)，週一至週五
+    - cron: '0 8 * * 1-5'
+    
+    # 3. 每週籌碼總結：台灣時間 週六 09:00 (UTC 01:00)
+    - cron: '0 1 * * 6'
+
+  # 允許手動點擊執行測試
+  workflow_dispatch:
 
 jobs:
   run_monitor:
@@ -12,10 +20,10 @@ jobs:
     
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4 # 使用最新 v4 版本避免警告
+        uses: actions/checkout@v4 # 升級至 v4 解決警告
 
       - name: Setup Python
-        uses: actions/setup-python@v5 # 使用最新 v5 版本避免警告
+        uses: actions/setup-python@v5 # 升級至 v5 解決警告
         with:
           python-version: '3.11'
 
@@ -26,7 +34,7 @@ jobs:
 
       - name: Execute Stock Monitor Script
         env:
-          # 這裡必須與您在 GitHub Secrets 中設定的名稱完全一致
+          # 將 GitHub Secrets 映射給 Python 程式使用
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
