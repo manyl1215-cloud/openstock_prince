@@ -33,58 +33,54 @@ stock_dict = {
 def send_telegram_msg(message):
     if not message: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}, timeout=10)
-    except:
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=10)
+    requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"})
 
-def get_today_sheet():
-    creds_dict = json.loads(GCP_KEY_JSON)
-    creds = Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/spreadsheets'])
-    client = gspread.authorize(creds)
-    ss = client.open_by_key(SHEET_ID)
-    today_str = (datetime.datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
-    try:
-        sheet = ss.worksheet(today_str)
-    except gspread.exceptions.WorksheetNotFound:
-        sheet = ss.add_worksheet(title=today_str, rows="100", cols="15")
-        sheet.update('A1:J1', [['日期', '代號', '名稱', '早:溢價', '早:走勢', '早:量', '', '晚:合計', '晚:外資', '晚:投信']])
-    
-    # 強制初始化檢查
-    if not sheet.acell('A2').value:
-        init_rows = [[today_str, sym.split('.')[0], name] for sym, name in stock_dict.items()]
-        sheet.update('A2:C' + str(len(init_rows) + 1), init_rows)
-    return sheet
-
-def fetch_chips_with_fallback():
-    """雙備援抓取：先 FinMind，失敗則直連證交所"""
+def fetch_chips_with_ultimate_fallback():
+    """終極抓取：FinMind -> Session 直連 -> 錯誤回報"""
     today_str = (datetime.datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
     
-    # 策略 1: FinMind (嘗試 3 次)
+    # 策略 1: FinMind (嘗試 2 次)
     dl = DataLoader()
-    for i in range(3):
+    for _ in range(2):
         try:
             df = dl.taiwan_stock_institutional_investors(dataset="TaiwanStockInstitutionalInvestorsBuySell", start_date=today_str)
             if not df.empty: return "finmind", df
-        except:
-            time.sleep(5)
+        except: time.sleep(5)
     
-    # 策略 2: 直連證交所 (Fallback)
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+    # 策略 2: 帶 Cookie 的 Session 直連
+    session = requests.Session()
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        'Referer': 'https://www.twse.com.tw/zh/page/trading/fund/T86W.html'
+    }
+    
     try:
+        # 先造訪首頁領取 Cookie
+        session.get("https://www.twse.com.tw/zh/index.html", headers=headers, timeout=10)
+        time.sleep(2)
+        
         twse_url = "https://www.twse.com.tw/rwd/zh/fund/T86W?response=json&selectType=ALL"
         tpex_url = "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php?l=zh-tw&o=json&se=AL&t=D"
-        twse_data = requests.get(twse_url, headers=headers, timeout=15).json()
-        tpex_data = requests.get(tpex_url, headers=headers, timeout=15).json()
-        return "direct", (pd.DataFrame(twse_data['data']), pd.DataFrame(tpex_data['aaData']))
-    except:
-        return "error", None
+        
+        twse_res = session.get(twse_url, headers=headers, timeout=15)
+        tpex_res = session.get(tpex_url, headers=headers, timeout=15)
+        
+        if twse_res.status_code == 200 and tpex_res.status_code == 200:
+            return "direct", (pd.DataFrame(twse_res.json()['data']), pd.DataFrame(tpex_res.json()['aaData']))
+        else:
+            return "fail", f"TWSE:{twse_res.status_code} TPEx:{tpex_res.status_code}"
+    except Exception as e:
+        return "error", str(e)
 
 def run_after_hours_report():
-    sheet = get_today_sheet()
-    mode, raw_data = fetch_chips_with_fallback()
+    creds_dict = json.loads(GCP_KEY_JSON)
+    creds = Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/spreadsheets'])
+    sheet = gspread.authorize(creds).open_by_key(SHEET_ID).get_worksheet(0)
     
-    if mode == "error": return "⚠️ 雙備援抓取皆失敗，伺服器可能正在維修。"
+    mode, raw_data = fetch_chips_with_ultimate_fallback()
+    
+    if mode in ["fail", "error"]:
+        return f"⚠️ 抓取失敗！原因: {raw_data}\n請確認證交所是否已公布今日數據。"
     
     chip_data, msg_list = [], []
     for sym, name in stock_dict.items():
@@ -105,48 +101,16 @@ def run_after_hours_report():
                     if not row.empty:
                         f, t = int(str(row.iloc[0][8]).replace(',',''))//1000, int(str(row.iloc[0][10]).replace(',',''))//1000
             
-            total = f + t
-            chip_data.append([total, f, t])
-            if abs(total) >= 200: msg_list.append(f"`{sid}` {name}: `{total:+d}張`")
+            chip_data.append([f+t, f, t])
+            if abs(f+t) >= 200: msg_list.append(f"`{sid}` {name}: `{f+t:+d}張`")
         except: chip_data.append([0, 0, 0])
 
     sheet.update('H2:J' + str(len(chip_data) + 1), chip_data)
-    msg = f"📊 *今日籌碼動向 (模式: {mode})*\n----------------------------\n"
-    msg += "\n".join(msg_list) if msg_list else "今日無大動作標的。"
-    return msg
-
-# --- 模式 A：早盤 (09:15) ---
-def run_morning_report():
-    sheet = get_today_sheet()
-    tickers = list(stock_dict.keys())
-    try:
-        df_all = yf.download(tickers, period="5d", interval="1d", group_by='ticker', progress=False)
-    except: return "❌ Yahoo Finance 抓取失敗"
-
-    morning_data, positive_gaps = [], []
-    for symbol in tickers:
-        try:
-            df = df_all[symbol]
-            if not df.empty and len(df) >= 2:
-                prev_c, op, now = df['Close'].iloc[-2], df['Open'].iloc[-1], df['Close'].iloc[-1]
-                gap, trend = ((op - prev_c) / prev_c) * 100, ((now - op) / op) * 100
-                vol = int(df['Volume'].iloc[-2] / 1000)
-                morning_data.append([f"{gap:.2f}%", f"{trend:.2f}%", vol])
-                if gap > 0: positive_gaps.append(f"`{symbol.split('.')[0]}` {stock_dict[symbol]}: `{gap:+.2f}%`")
-            else: morning_data.append(["-", "-", 0])
-        except: morning_data.append(["err", "-", 0])
-
-    sheet.update('D2:F' + str(len(morning_data) + 1), morning_data)
-    msg = f"🌅 *今日早盤溢價名單*\n----------------------------\n"
-    msg += "\n".join(positive_gaps) if positive_gaps else "今日無正溢價標的。"
-    return msg
+    return f"📊 *今日籌碼重點 (模式: {mode})*\n----------------------------\n" + "\n".join(msg_list)
 
 if __name__ == "__main__":
-    try:
-        now = datetime.datetime.utcnow() + timedelta(hours=8)
-        if now.weekday() < 5:
-            send_telegram_msg(f"🚀 系統啟動 | {now.strftime('%H:%M')}")
-            report = run_after_hours_report() if now.hour >= 14 else run_morning_report()
-            send_telegram_msg(report)
-    except Exception as e:
-        send_telegram_msg(f"🆘 系統崩潰: {str(e)}")
+    now = datetime.datetime.utcnow() + timedelta(hours=8)
+    if now.weekday() < 5:
+        # 下午六點這個時間點，資料應該都進場了
+        report = run_after_hours_report() if now.hour >= 14 else "早盤邏輯執行中..." 
+        send_telegram_msg(report)
