@@ -10,10 +10,10 @@ from google.oauth2.service_account import Credentials
 from datetime import timedelta
 from FinMind.data import DataLoader
 
-# 1. 基礎設定
+# 1. 讀取 Secrets
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-GCP_KEY = os.getenv('GCP_SERVICE_ACCOUNT_KEY')
+GCP_KEY_JSON = os.getenv('GCP_SERVICE_ACCOUNT_KEY')
 SHEET_ID = os.getenv('GOOGLE_SHEET_ID')
 
 stock_dict = {
@@ -32,67 +32,38 @@ stock_dict = {
 def send_telegram_msg(message):
     if not message: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"})
+    try:
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}, timeout=10)
+    except:
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=10)
 
 def get_today_sheet():
-    creds_dict = json.loads(GCP_KEY)
+    """取得或初始化今日分頁，確保 A, B, C 欄位一定出現"""
+    creds_dict = json.loads(GCP_KEY_JSON)
     creds = Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/spreadsheets'])
     client = gspread.authorize(creds)
     ss = client.open_by_key(SHEET_ID)
     today_str = (datetime.datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
+    
     try:
         sheet = ss.worksheet(today_str)
     except gspread.exceptions.WorksheetNotFound:
-        sheet = ss.add_worksheet(title=today_str, rows="100", cols="12")
-        sheet.update('A1:J1', [['日期', '代號', '名稱', '早:溢價', '早:走勢', '早:量', '', '晚:合計', '晚:外資', '晚:投信']])
-    if not sheet.acell('A2').value:
+        sheet = ss.add_worksheet(title=today_str, rows="100", cols="15")
+        headers = [['日期', '代號', '名稱', '早:溢價', '早:走勢', '早:量', '', '晚:合計', '晚:外資', '晚:投信']]
+        sheet.update('A1:J1', headers)
+    
+    # 檢查第二列是否已有基礎資料，若無則填入
+    existing_data = sheet.row_values(2)
+    if not existing_data:
         init_rows = [[today_str, sym.split('.')[0], name] for sym, name in stock_dict.items()]
         sheet.update('A2:C' + str(len(init_rows) + 1), init_rows)
-    return sheet
-
-def run_after_hours_report():
-    sheet = get_today_sheet()
-    dl = DataLoader()
-    today_str = (datetime.datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
     
-    try:
-        # 使用 FinMind 抓取今日法人買賣超資料
-        df = dl.taiwan_stock_institutional_investors(
-            dataset="TaiwanStockInstitutionalInvestorsBuySell",
-            start_date=today_str
-        )
-    except Exception as e:
-        return f"⚠️ FinMind 連線異常: {str(e)}"
-
-    if df.empty:
-        return f"📊 {today_str} 法人資料尚未更新，請 16:30 後再試。"
-
-    chip_data, msg_list = [], []
-    for sym, name in stock_dict.items():
-        sid = sym.split('.')[0]
-        try:
-            # 篩選該股票今日的數據
-            stock_df = df[df['stock_id'] == sid]
-            # 外資 = Foreign_Investor_Buy_Sell, 投信 = Investment_Trust_Buy_Sell
-            f = stock_df[stock_df['name'] == 'Foreign_Investor_Buy_Sell']['buy_sell'].sum() // 1000
-            t = stock_df[stock_df['name'] == 'Investment_Trust_Buy_Sell']['buy_sell'].sum() // 1000
-            
-            total = f + t
-            chip_data.append([total, f, t])
-            if abs(total) >= 200:
-                icon = "💎" if total > 0 else "💀"
-                msg_list.append(f"{icon} `{sid}` {name}: `{total:+d}張`")
-        except:
-            chip_data.append([0, 0, 0])
-
-    sheet.update('H2:J' + str(len(chip_data) + 1), chip_data)
-    msg = f"📊 *{today_str} 法人籌碼動態*\n----------------------------\n"
-    msg += "\n".join(msg_list) if msg_list else "今日無大動作標的。"
-    return msg
+    return sheet
 
 def run_morning_report():
     sheet = get_today_sheet()
     tickers = list(stock_dict.keys())
+    # 批量下載提高穩定性
     df_all = yf.download(tickers, period="5d", interval="1d", group_by='ticker', progress=False)
     
     morning_data, positive_gaps = [], []
@@ -101,20 +72,51 @@ def run_morning_report():
             df = df_all[symbol]
             if not df.empty and len(df) >= 2:
                 prev_c, op, now = df['Close'].iloc[-2], df['Open'].iloc[-1], df['Close'].iloc[-1]
-                gap, trend = ((op - prev_c) / prev_c) * 100, ((now - op) / op) * 100
-                vol = int(df['Volume'].iloc[-2] / 1000)
+                gap, trend, vol = ((op-prev_c)/prev_c)*100, ((now-op)/op)*100, int(df['Volume'].iloc[-2]/1000)
                 morning_data.append([f"{gap:.2f}%", f"{trend:.2f}%", vol])
                 if gap > 0: positive_gaps.append(f"`{symbol.split('.')[0]}` {stock_dict[symbol]}: `{gap:+.2f}%`")
             else: morning_data.append(["-", "-", 0])
         except: morning_data.append(["err", "-", 0])
 
     sheet.update('D2:F' + str(len(morning_data) + 1), morning_data)
-    msg = f"🌅 *今日早盤溢價名單*\n----------------------------\n"
-    msg += "\n".join(positive_gaps) if positive_gaps else "今日無正溢價標的。"
+    msg = "🌅 *今日早盤溢價監控*\n" + "\n".join(positive_gaps) if positive_gaps else "今日無正溢價標的。"
+    return msg
+
+def run_after_hours_report():
+    sheet = get_today_sheet()
+    dl = DataLoader()
+    today_str = (datetime.datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
+    
+    try:
+        df = dl.taiwan_stock_institutional_investors(dataset="TaiwanStockInstitutionalInvestorsBuySell", start_date=today_str)
+    except: return "⚠️ FinMind 伺服器回應逾時。"
+
+    if df.empty: return f"📊 {today_str} 籌碼資料尚未更新。"
+
+    chip_data, msg_list = [], []
+    for sym, name in stock_dict.items():
+        sid = sym.split('.')[0]
+        try:
+            stock_df = df[df['stock_id'] == sid]
+            f = stock_df[stock_df['name'] == 'Foreign_Investor_Buy_Sell']['buy_sell'].sum() // 1000
+            t = stock_df[stock_df['name'] == 'Investment_Trust_Buy_Sell']['buy_sell'].sum() // 1000
+            chip_data.append([f+t, f, t])
+            if abs(f+t) >= 200: msg_list.append(f"`{sid}` {name}: `{f+t:+d}張`")
+        except: chip_data.append([0, 0, 0])
+
+    sheet.update('H2:J' + str(len(chip_data) + 1), chip_data)
+    msg = f"📊 *今日法人籌碼動向*\n" + "\n".join(msg_list) if msg_list else "今日無大動作標的。"
     return msg
 
 if __name__ == "__main__":
-    now = datetime.datetime.utcnow() + timedelta(hours=8)
-    if now.weekday() < 5:
-        report = run_after_hours_report() if now.hour >= 14 else run_morning_report()
-        send_telegram_msg(report)
+    try:
+        now = datetime.datetime.utcnow() + timedelta(hours=8)
+        # 排除週末執行
+        if now.weekday() < 5:
+            # 立即發送「開始執行」訊號 (偵錯用)
+            send_telegram_msg(f"🚀 監控系統已啟動 | 模式: {'盤後' if now.hour >= 14 else '早盤'}")
+            
+            report = run_after_hours_report() if now.hour >= 14 else run_morning_report()
+            send_telegram_msg(report)
+    except Exception as e:
+        send_telegram_msg(f"🆘 系統崩潰: {str(e)}")
