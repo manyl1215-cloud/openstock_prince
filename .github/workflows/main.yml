@@ -27,11 +27,12 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Dependencies
+     - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install yfinance pandas requests gspread google-auth FinMind
-
+          # 一次安裝所有需要的工具，確保不再報錯
+          pip install yfinance pandas requests gspread google-auth FinMind tqdm
+          
       - name: Execute Stock Monitor Script
         env:
           # 將 GitHub Secrets 映射給 Python 程式使用
