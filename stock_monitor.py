@@ -6,9 +6,9 @@ import gspread
 import datetime
 import yfinance as yf
 import time
-import random
 from google.oauth2.service_account import Credentials
 from datetime import timedelta
+from FinMind.data import DataLoader
 
 # 1. 基礎設定
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
@@ -32,82 +32,50 @@ stock_dict = {
 def send_telegram_msg(message):
     if not message: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    res = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"})
-    if res.status_code != 200:
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message})
+    requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"})
 
 def get_today_sheet():
     creds_dict = json.loads(GCP_KEY)
     creds = Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/spreadsheets'])
-    for attempt in range(3):
-        try:
-            client = gspread.authorize(creds)
-            ss = client.open_by_key(SHEET_ID)
-            today_str = (datetime.datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
-            try:
-                sheet = ss.worksheet(today_str)
-            except gspread.exceptions.WorksheetNotFound:
-                sheet = ss.add_worksheet(title=today_str, rows="100", cols="12")
-                sheet.update('A1:J1', [['日期', '代號', '名稱', '早:溢價', '早:走勢', '早:量', '', '晚:合計', '晚:外資', '晚:投信']])
-            if not sheet.acell('A2').value:
-                init_rows = [[today_str, sym.split('.')[0], name] for sym, name in stock_dict.items()]
-                sheet.update('A2:C' + str(len(init_rows) + 1), init_rows)
-            return sheet
-        except:
-            time.sleep(5)
-            continue
+    client = gspread.authorize(creds)
+    ss = client.open_by_key(SHEET_ID)
+    today_str = (datetime.datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
+    try:
+        sheet = ss.worksheet(today_str)
+    except gspread.exceptions.WorksheetNotFound:
+        sheet = ss.add_worksheet(title=today_str, rows="100", cols="12")
+        sheet.update('A1:J1', [['日期', '代號', '名稱', '早:溢價', '早:走勢', '早:量', '', '晚:合計', '晚:外資', '晚:投信']])
+    if not sheet.acell('A2').value:
+        init_rows = [[today_str, sym.split('.')[0], name] for sym, name in stock_dict.items()]
+        sheet.update('A2:C' + str(len(init_rows) + 1), init_rows)
+    return sheet
 
 def run_after_hours_report():
     sheet = get_today_sheet()
-    # 模擬更真實的瀏覽器標頭
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7'
-    }
+    dl = DataLoader()
+    today_str = (datetime.datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
     
-    twse_df, tpex_df = None, None
-    
-    # --- 抓取上市資料 (最多試 3 次) ---
-    for i in range(3):
-        try:
-            twse_res = requests.get("https://www.twse.com.tw/rwd/zh/fund/T86W?response=json&selectType=ALL", headers=headers, timeout=20)
-            twse_data = twse_res.json()
-            if 'data' in twse_data:
-                twse_df = pd.DataFrame(twse_data['data'])
-                break
-        except:
-            time.sleep(random.randint(5, 10))
-    
-    time.sleep(random.randint(3, 6)) # 兩次抓取間隔
+    try:
+        # 使用 FinMind 抓取今日法人買賣超資料
+        df = dl.taiwan_stock_institutional_investors(
+            dataset="TaiwanStockInstitutionalInvestorsBuySell",
+            start_date=today_str
+        )
+    except Exception as e:
+        return f"⚠️ FinMind 連線異常: {str(e)}"
 
-    # --- 抓取上櫃資料 (最多試 3 次) ---
-    for i in range(3):
-        try:
-            tpex_res = requests.get("https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php?l=zh-tw&o=json&se=AL&t=D", headers=headers, timeout=20)
-            tpex_data = tpex_res.json()
-            if 'aaData' in tpex_data:
-                tpex_df = pd.DataFrame(tpex_data['aaData'])
-                break
-        except:
-            time.sleep(random.randint(5, 10))
-
-    if twse_df is None and tpex_df is None:
-        return "⚠️ 證交所伺服器拒絕連線，請 10 分鐘後手動重試。"
+    if df.empty:
+        return f"📊 {today_str} 法人資料尚未更新，請 16:30 後再試。"
 
     chip_data, msg_list = [], []
     for sym, name in stock_dict.items():
-        sid, f, t = sym.split('.')[0], 0, 0
+        sid = sym.split('.')[0]
         try:
-            if sym.endswith('.TW') and twse_df is not None:
-                row = twse_df[twse_df[0].str.strip() == sid]
-                if not row.empty:
-                    f = int(row.iloc[0][2].replace(',','')) // 1000
-                    t = int(row.iloc[0][12].replace(',','')) // 1000
-            elif sym.endswith('.TWO') and tpex_df is not None:
-                row = tpex_df[tpex_df[0].str.strip() == sid]
-                if not row.empty:
-                    f = int(str(row.iloc[0][8]).replace(',','')) // 1000
-                    t = int(str(row.iloc[0][10]).replace(',','')) // 1000
+            # 篩選該股票今日的數據
+            stock_df = df[df['stock_id'] == sid]
+            # 外資 = Foreign_Investor_Buy_Sell, 投信 = Investment_Trust_Buy_Sell
+            f = stock_df[stock_df['name'] == 'Foreign_Investor_Buy_Sell']['buy_sell'].sum() // 1000
+            t = stock_df[stock_df['name'] == 'Investment_Trust_Buy_Sell']['buy_sell'].sum() // 1000
             
             total = f + t
             chip_data.append([total, f, t])
@@ -118,18 +86,15 @@ def run_after_hours_report():
             chip_data.append([0, 0, 0])
 
     sheet.update('H2:J' + str(len(chip_data) + 1), chip_data)
-    msg = "📊 *今日法人籌碼重點 (門檻200張)*\n----------------------------\n"
+    msg = f"📊 *{today_str} 法人籌碼動態*\n----------------------------\n"
     msg += "\n".join(msg_list) if msg_list else "今日無大動作標的。"
     return msg
 
-# (run_morning_report 邏輯與之前相同，僅確保呼叫 get_today_sheet)
 def run_morning_report():
     sheet = get_today_sheet()
     tickers = list(stock_dict.keys())
-    try:
-        df_all = yf.download(tickers, period="5d", interval="1d", group_by='ticker', progress=False)
-    except: return "❌ Yahoo Finance 連線失敗"
-
+    df_all = yf.download(tickers, period="5d", interval="1d", group_by='ticker', progress=False)
+    
     morning_data, positive_gaps = [], []
     for symbol in tickers:
         try:
@@ -149,10 +114,7 @@ def run_morning_report():
     return msg
 
 if __name__ == "__main__":
-    try:
-        now = datetime.datetime.utcnow() + timedelta(hours=8)
-        if now.weekday() < 5:
-            report = run_after_hours_report() if now.hour >= 14 else run_morning_report()
-            send_telegram_msg(report)
-    except Exception as e:
-        send_telegram_msg(f"🆘 程式崩潰: {str(e)}")
+    now = datetime.datetime.utcnow() + timedelta(hours=8)
+    if now.weekday() < 5:
+        report = run_after_hours_report() if now.hour >= 14 else run_morning_report()
+        send_telegram_msg(report)
