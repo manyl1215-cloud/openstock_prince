@@ -10,12 +10,13 @@ from google.oauth2.service_account import Credentials
 from datetime import timedelta
 from FinMind.data import DataLoader
 
-# 1. 基礎設定
+# 1. 讀取環境變數
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 GCP_KEY_JSON = os.getenv('GCP_SERVICE_ACCOUNT_KEY')
 SHEET_ID = os.getenv('GOOGLE_SHEET_ID')
 
+# 2. 自選股名單
 stock_dict = {
     '2454.TW': '聯發科', '2330.TW': '台積電', '2317.TW': '鴻海', '2382.TW': '廣達',
     '3711.TW': '日月光', '2308.TW': '台達電', '2376.TW': '技嘉', '2347.TW': '聯強',
@@ -34,43 +35,8 @@ def send_telegram_msg(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"})
 
-def fetch_chips_with_ultimate_fallback():
-    """修正版抓取：加入精確日期參數"""
-    now = datetime.datetime.utcnow() + timedelta(hours=8)
-    today_dash = now.strftime('%Y-%m-%d')
-    today_nodash = now.strftime('%Y%m%d')
-    
-    # 策略 1: FinMind
-    dl = DataLoader()
-    try:
-        df = dl.taiwan_stock_institutional_investors(dataset="TaiwanStockInstitutionalInvestorsBuySell", start_date=today_dash)
-        if not df.empty: return "finmind", df
-    except: pass
-    
-    # 策略 2: 直連證交所 (修正 404 問題)
-    session = requests.Session()
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-        'Referer': 'https://www.twse.com.tw/'
-    }
-    
-    try:
-        # 強制指定日期參數，解決 404
-        twse_url = f"https://www.twse.com.tw/rwd/zh/fund/T86W?date={today_nodash}&selectType=ALL&response=json"
-        tpex_url = f"https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php?l=zh-tw&o=json&se=AL&t=D"
-        
-        twse_res = session.get(twse_url, headers=headers, timeout=15)
-        tpex_res = session.get(tpex_url, headers=headers, timeout=15)
-        
-        if twse_res.status_code == 200 and tpex_res.status_code == 200:
-            return "direct", (pd.DataFrame(twse_res.json()['data']), pd.DataFrame(tpex_res.json()['aaData']))
-        else:
-            return "fail", f"TWSE:{twse_res.status_code} TPEx:{tpex_res.status_code}"
-    except Exception as e:
-        return "error", str(e)
-
-def run_after_hours_report():
-    # 初始化 Sheets
+def get_today_sheet():
+    """初始化今日分頁並填入 A, B, C 欄位"""
     creds_dict = json.loads(GCP_KEY_JSON)
     creds = Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/spreadsheets'])
     client = gspread.authorize(creds)
@@ -81,13 +47,49 @@ def run_after_hours_report():
         sheet = ss.worksheet(today_str)
     except gspread.exceptions.WorksheetNotFound:
         sheet = ss.add_worksheet(title=today_str, rows="100", cols="15")
-        sheet.update('A1:J1', [['日期', '代號', '名稱', '早:溢價', '早:走勢', '早:量', '', '晚:合計', '晚:外資', '晚:投信']])
+        headers = [['日期', '代號', '名稱', '早:溢價', '早:走勢', '早:量', '', '晚:合計', '晚:外資', '晚:投信']]
+        sheet.update('A1:J1', headers)
     
+    # 檢查並填入基礎資料
     if not sheet.acell('A2').value:
         init_rows = [[today_str, sym.split('.')[0], name] for sym, name in stock_dict.items()]
         sheet.update('A2:C' + str(len(init_rows) + 1), init_rows)
+    return sheet
 
-    mode, raw_data = fetch_chips_with_ultimate_fallback()
+def fetch_chips_stable():
+    """修正 404 問題的抓取邏輯"""
+    now = datetime.datetime.utcnow() + timedelta(hours=8)
+    today_dash = now.strftime('%Y-%m-%d')
+    today_nodash = now.strftime('%Y%m%d')
+    
+    # 策略 1: FinMind (備援)
+    try:
+        dl = DataLoader()
+        df = dl.taiwan_stock_institutional_investors(dataset="TaiwanStockInstitutionalInvestorsBuySell", start_date=today_dash)
+        if not df.empty: return "finmind", df
+    except: pass
+    
+    # 策略 2: 直連證交所 (修正日期參數)
+    session = requests.Session()
+    headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.twse.com.tw/'}
+    try:
+        # 強制加入 date 參數避免 404
+        twse_url = f"https://www.twse.com.tw/rwd/zh/fund/T86W?response=json&date={today_nodash}&selectType=ALL"
+        tpex_url = f"https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php?l=zh-tw&o=json&se=AL&t=D"
+        
+        twse_res = session.get(twse_url, headers=headers, timeout=15)
+        tpex_res = session.get(tpex_url, headers=headers, timeout=15)
+        
+        if twse_res.status_code == 200 and tpex_res.status_code == 200:
+            return "direct", (pd.DataFrame(twse_res.json()['data']), pd.DataFrame(tpex_res.json()['aaData']))
+        return "fail", f"TWSE:{twse_res.status_code} TPEx:{tpex_res.status_code}"
+    except Exception as e:
+        return "error", str(e)
+
+def run_after_hours_report():
+    sheet = get_today_sheet()
+    mode, raw_data = fetch_chips_stable()
+    
     if mode in ["fail", "error"]:
         return f"⚠️ 抓取失敗！原因: {raw_data}"
     
@@ -118,10 +120,30 @@ def run_after_hours_report():
             chip_data.append([0, 0, 0])
 
     sheet.update('H2:J' + str(len(chip_data) + 1), chip_data)
-    return f"📊 *今日籌碼重點 (模式: {mode})*\n----------------------------\n" + "\n".join(msg_list)
+    return f"📊 *今日籌碼動態 (模式: {mode})*\n----------------------------\n" + "\n".join(msg_list)
+
+def run_morning_report():
+    sheet = get_today_sheet()
+    tickers = list(stock_dict.keys())
+    df_all = yf.download(tickers, period="5d", interval="1d", group_by='ticker', progress=False)
+    
+    morning_data, positive_gaps = [], []
+    for symbol in tickers:
+        try:
+            df = df_all[symbol]
+            if not df.empty and len(df) >= 2:
+                prev_c, op, now = df['Close'].iloc[-2], df['Open'].iloc[-1], df['Close'].iloc[-1]
+                gap, trend, vol = ((op-prev_c)/prev_c)*100, ((now-op)/op)*100, int(df['Volume'].iloc[-2]/1000)
+                morning_data.append([f"{gap:.2f}%", f"{trend:.2f}%", vol])
+                if gap > 0: positive_gaps.append(f"`{symbol.split('.')[0]}` {stock_dict[symbol]}: `{gap:+.2f}%`")
+            else: morning_data.append(["-", "-", 0])
+        except: morning_data.append(["err", "-", 0])
+
+    sheet.update('D2:F' + str(len(morning_data) + 1), morning_data)
+    return "🌅 *今日早盤正溢價監控*\n" + "\n".join(positive_gaps)
 
 if __name__ == "__main__":
     now = datetime.datetime.utcnow() + timedelta(hours=8)
     if now.weekday() < 5:
-        report = run_after_hours_report() if now.hour >= 14 else "目前為早盤監控時段..."
+        report = run_after_hours_report() if now.hour >= 14 else run_morning_report()
         send_telegram_msg(report)
