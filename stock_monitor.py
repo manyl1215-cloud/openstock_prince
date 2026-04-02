@@ -6,7 +6,6 @@ import gspread
 import datetime
 import yfinance as yf
 import time
-import random
 from google.oauth2.service_account import Credentials
 from datetime import timedelta
 from FinMind.data import DataLoader
@@ -36,31 +35,29 @@ def send_telegram_msg(message):
     requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"})
 
 def fetch_chips_with_ultimate_fallback():
-    """終極抓取：FinMind -> Session 直連 -> 錯誤回報"""
-    today_str = (datetime.datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
+    """修正版抓取：加入精確日期參數"""
+    now = datetime.datetime.utcnow() + timedelta(hours=8)
+    today_dash = now.strftime('%Y-%m-%d')
+    today_nodash = now.strftime('%Y%m%d')
     
-    # 策略 1: FinMind (嘗試 2 次)
+    # 策略 1: FinMind
     dl = DataLoader()
-    for _ in range(2):
-        try:
-            df = dl.taiwan_stock_institutional_investors(dataset="TaiwanStockInstitutionalInvestorsBuySell", start_date=today_str)
-            if not df.empty: return "finmind", df
-        except: time.sleep(5)
+    try:
+        df = dl.taiwan_stock_institutional_investors(dataset="TaiwanStockInstitutionalInvestorsBuySell", start_date=today_dash)
+        if not df.empty: return "finmind", df
+    except: pass
     
-    # 策略 2: 帶 Cookie 的 Session 直連
+    # 策略 2: 直連證交所 (修正 404 問題)
     session = requests.Session()
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-        'Referer': 'https://www.twse.com.tw/zh/page/trading/fund/T86W.html'
+        'Referer': 'https://www.twse.com.tw/'
     }
     
     try:
-        # 先造訪首頁領取 Cookie
-        session.get("https://www.twse.com.tw/zh/index.html", headers=headers, timeout=10)
-        time.sleep(2)
-        
-        twse_url = "https://www.twse.com.tw/rwd/zh/fund/T86W?response=json&selectType=ALL"
-        tpex_url = "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php?l=zh-tw&o=json&se=AL&t=D"
+        # 強制指定日期參數，解決 404
+        twse_url = f"https://www.twse.com.tw/rwd/zh/fund/T86W?date={today_nodash}&selectType=ALL&response=json"
+        tpex_url = f"https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php?l=zh-tw&o=json&se=AL&t=D"
         
         twse_res = session.get(twse_url, headers=headers, timeout=15)
         tpex_res = session.get(tpex_url, headers=headers, timeout=15)
@@ -73,14 +70,26 @@ def fetch_chips_with_ultimate_fallback():
         return "error", str(e)
 
 def run_after_hours_report():
+    # 初始化 Sheets
     creds_dict = json.loads(GCP_KEY_JSON)
     creds = Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/spreadsheets'])
-    sheet = gspread.authorize(creds).open_by_key(SHEET_ID).get_worksheet(0)
+    client = gspread.authorize(creds)
+    ss = client.open_by_key(SHEET_ID)
+    today_str = (datetime.datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
     
+    try:
+        sheet = ss.worksheet(today_str)
+    except gspread.exceptions.WorksheetNotFound:
+        sheet = ss.add_worksheet(title=today_str, rows="100", cols="15")
+        sheet.update('A1:J1', [['日期', '代號', '名稱', '早:溢價', '早:走勢', '早:量', '', '晚:合計', '晚:外資', '晚:投信']])
+    
+    if not sheet.acell('A2').value:
+        init_rows = [[today_str, sym.split('.')[0], name] for sym, name in stock_dict.items()]
+        sheet.update('A2:C' + str(len(init_rows) + 1), init_rows)
+
     mode, raw_data = fetch_chips_with_ultimate_fallback()
-    
     if mode in ["fail", "error"]:
-        return f"⚠️ 抓取失敗！原因: {raw_data}\n請確認證交所是否已公布今日數據。"
+        return f"⚠️ 抓取失敗！原因: {raw_data}"
     
     chip_data, msg_list = [], []
     for sym, name in stock_dict.items():
@@ -102,8 +111,11 @@ def run_after_hours_report():
                         f, t = int(str(row.iloc[0][8]).replace(',',''))//1000, int(str(row.iloc[0][10]).replace(',',''))//1000
             
             chip_data.append([f+t, f, t])
-            if abs(f+t) >= 200: msg_list.append(f"`{sid}` {name}: `{f+t:+d}張`")
-        except: chip_data.append([0, 0, 0])
+            if abs(f+t) >= 200:
+                icon = "💎" if f+t > 0 else "💀"
+                msg_list.append(f"{icon} `{sid}` {name}: `{f+t:+d}張`")
+        except:
+            chip_data.append([0, 0, 0])
 
     sheet.update('H2:J' + str(len(chip_data) + 1), chip_data)
     return f"📊 *今日籌碼重點 (模式: {mode})*\n----------------------------\n" + "\n".join(msg_list)
@@ -111,6 +123,5 @@ def run_after_hours_report():
 if __name__ == "__main__":
     now = datetime.datetime.utcnow() + timedelta(hours=8)
     if now.weekday() < 5:
-        # 下午六點這個時間點，資料應該都進場了
-        report = run_after_hours_report() if now.hour >= 14 else "早盤邏輯執行中..." 
+        report = run_after_hours_report() if now.hour >= 14 else "目前為早盤監控時段..."
         send_telegram_msg(report)
