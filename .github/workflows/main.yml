@@ -2,22 +2,14 @@ name: Taiwan Stock Automated Monitor
 
 on:
   schedule:
-    # 1. 平日開盤監控：台灣時間 09:15 (UTC 01:15)，週一至週五
-    - cron: '15 1 * * 1-5'
-    
-    # 2. 平日盤後籌碼：台灣時間 16:00 (UTC 08:00)，週一至週五
-    - cron: '0 8 * * 1-5'
-    
-    # 3. 每週籌碼總結：台灣時間 週六 09:00 (UTC 01:00)
-    - cron: '0 1 * * 6'
-
-  # 允許手動點擊執行測試
-  workflow_dispatch:
+    - cron: '15 1 * * 1-5' # 09:15 TW
+    - cron: '0 8 * * 1-5'  # 16:00 TW
+    - cron: '0 1 * * 6'    # 09:00 Sat
+  workflow_dispatch: # 允許手動點擊測試
 
 jobs:
   run_monitor:
     runs-on: ubuntu-latest
-    
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -30,12 +22,10 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          # 安裝所有必要套件，包含 yfinance, FinMind 及其依賴項 tqdm
           pip install yfinance pandas requests gspread google-auth FinMind tqdm
 
       - name: Execute Stock Monitor Script
         env:
-          # 從 GitHub Secrets 讀取敏感資訊並映射為環境變數
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
